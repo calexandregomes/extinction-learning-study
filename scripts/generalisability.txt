@@ -1,0 +1,543 @@
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(glmnet)
+library(caret)
+library(emmeans)
+library(car)
+require(doMC) # For parallelising lasso
+library(TOSTER)
+library(scales)
+
+cl <- parallel::makeCluster(24)
+doParallel::registerDoParallel(cl)
+
+gen = 1
+norm = 1
+
+root_dir = "/media/sf_G_80tb/"
+base_dir = file.path(root_dir, "F02")
+group_dir =  file.path(base_dir, "group")
+fig_dir =  file.path(root_dir,"figures")
+
+% load helper functions: normData, scale2, composite_score, etc.
+source(file.path(root_dir,"scripts","R","misc_funs.R"))
+
+ptc_files = Sys.glob(file.path(base_dir,"A*","*","rawdata","participants.tsv"))
+
+dat_learn_EDA = read.csv(file.path(group_dir, "learning", "stat-bf_desc-EDA_df.tsv"), sep='\t')
+dat_learn_beh = read.csv(file.path(group_dir, "learning", "stat-logit_desc-beh_df.tsv"), sep='\t')
+dat_learn = bind_rows(dat_learn_beh, dat_learn_EDA)
+
+dat_learn = dat_learn %>% mutate(type_dv = case_when(
+  AG %in% c("A02") ~ "DCM1",
+  AG %in% c("A03","A05","A09") ~ "DCM2",
+  AG %in% c("A12") ~ "SF",
+  AG %in% c("A08") ~ "Beh"))
+
+covariates = c("age","sex")
+
+demographics = get_demogs(ptc_files, c("participant_id","AG","study",covariates)) 
+
+comb_AG = list(c("A08"), # PL
+               c("A03"),# FLr
+               c("A02","A03","A05","A09","A12"), # FL
+               c("A02","A03","A05","A08","A09","A12")) # All
+
+dupls = read.csv(file.path(base_dir, "desc-duplicates_df.tsv"), sep='\t')
+excl_subs = dupls[dupls$keep==0,c("participant","AG","study")]
+dat_learn = anti_join(dat_learn, excl_subs, by=c("participant","AG","study"))
+
+df_learndemo = demographics %>% rename(participant=participant_id) %>% 
+  right_join(dat_learn, by=c("participant","AG","study"), multiple='all')
+
+dat_excl_conn = read.csv(file.path(base_dir, "desc-ExcludeSubsConn_table.tsv"), sep='\t')
+
+
+dat_FC = read.csv(file.path(group_dir, "FC", "desc-FC_df.tsv"), sep='\t')
+dat_FC = subset(dat_FC, !(participant %in% dat_excl_conn[dat_excl_conn$pipeline=="FC",]$participant_id))
+
+dat_SC = read.csv(file.path(group_dir, "SC", "desc-SC_df.tsv"), sep='\t')
+dat_SC = subset(dat_DTI, !(participant %in% dat_excl_conn[dat_excl_conn$pipeline=="DTI",]$participant_id))
+
+dat_EC = read.csv(file.path(group_dir,"EC","desc-EC_df.tsv"), sep='\t')
+dat_EC = subset(dat_spDCM, !(participant %in% dat_excl_conn[dat_excl_conn$pipeline=="spDCM",]$participant_id))
+
+df_comb = data.frame(); df_coefs = data.frame(); df.mse = data.frame(); df.mse2 = data.frame(); df.boot = data.frame();
+
+l = list(FC=dat_FC, SC=dat_SC, EC=dat_EC)
+for (nAG in 1:length(comb_AG)) {
+  AGs = comb_AG[[nAG]]
+  
+  for (n in 1:length(l)) {
+    
+    if (names(l[n]) == 'FC') {
+      metric = c('corrLW','xcorr','EuclideanDist','ManhattanDist','WassersteinDist','dtw','MI','mscohe','wavcohe')
+      inv = c('EuclideanDist','ManhattanDist','WassersteinDist','dtw')
+      absl = c('corrLW')
+      dat_conn = dat_FC
+      pair='pair_und'
+    } else if (names(l[n]) == 'SC') {
+      metric = 'streamlines'
+      dat_conn = dat_DTI
+      pair='pair_und'
+    } else {
+      metric = 'spDCM'
+      dat_conn = dat_spDCM
+      pair='pair_dir'
+    }
+    
+    dat_conn = subset(dat_conn, hemisphere!="bilateral")
+    
+    df_join = right_join(df_learndemo, dat_conn, by=c("participant","AG","study"), multiple='all')
+    
+    ####### CHOOSE WHICH AGs TO INCLUDE IN THE ANALYSIS HERE #######
+    df_join = df_join %>% subset(AG %in% AGs)
+    if (dim(df_join)[1]==0) {next}
+    ################################################################
+    
+    df_sel = df_join %>% group_by(participant, AG, study) %>% filter(if_all(!!metric, ~ all(!is.na(.x))))
+    
+    # df_sel will contain the final sample - that is, excluding subs with any NAs
+    # Calculate the composite score
+    if (names(l[n]) == 'FC') {
+      df_sel = composite_score(df_sel, cols=metric, inv=inv, absl=absl, keep_ori="corrLW")
+      metric = "composite"
+    }
+    selvars = unique(c("participant","AG","study","task",pair,metric,"learning",covariates))
+        
+    if (norm==1) {
+      df = df_sel[selvars] %>% group_by(AG,study,task,across(all_of(pair))) %>% group_modify(~ normData(.x)) %>%
+        pivot_wider(names_from=all_of(pair), values_from=all_of(metric), values_fn=mean) %>% ungroup()
+    } else {
+      df = df_sel[selvars] %>% group_by(AG,study,task,across(all_of(pair))) %>%
+        pivot_wider(names_from=all_of(pair), values_from=all_of(metric), values_fn=mean) %>% ungroup()
+    }
+    
+    df$const <- factor(rep(1, each=length(df$participant)))
+    
+    df_acq = subset(df, task == "acquisition")
+    df_ext = subset(df, task == "extinction")
+    df_ren = subset(df, task == "renewal")
+    
+    if (tasK=="AC") {
+      mdf = df_acq
+    } else if (tasK=="EX") {
+      mdf = df_ext
+    } else {
+	  mdf = df_ren
+    
+    pairs = colnames(mdf %>% dplyr::select(starts_with(
+      c('AMY','CEB','HIP','ACC','PFC','lAMY','lCEB','lHIP','lACC','lPFC','rAMY','rCEB','rHIP','rACC','rPFC'))))
+    
+    ##################################################################################################################    
+    if (gen==1){
+      ###########################################################
+      # calculate generalisibility using mean squared errors
+      ###########################################################
+      uAGs = list(list(train=c("A08"), test=c("A02","A03","A05","A09","A12"), name="PL_vs_FL"), 
+                  list(test=c("A08"), train=c("A02","A03","A05","A09","A12"), name="FL_vs_PL"))    
+				  
+      for (iAG in seq_along(uAGs)) {
+        training <- subset(mdf, AG %in% uAGs[[iAG]]$train)
+        testing <- subset(mdf, AG %in% uAGs[[iAG]]$test)
+        
+        #################################################################
+        #################### RIDGE ######################################
+        #################################################################
+        y <- training$learning #train_sample$learning
+        xx <- training %>% ungroup() %>% dplyr::select(all_of(c(pairs,covariates)))
+        x = data.matrix(makeX(xx, na.impute = TRUE))
+        myalpha = 1
+        
+        if (!is.null(covariates)) {
+          force.vars = as.integer(!Reduce('|', lapply(covariates, function(y) startsWith(as.character(colnames(x)), y))))
+        } else {
+          force.vars = rep(1, ncol(xx))
+        }
+        
+        #####################
+        ##### Run ridge
+        #####################
+        #####################
+        lambdas = foreach(i = 1:100, .combine='rbind', .packages="glmnet") %dopar% {
+          fit <- cv.glmnet(x, y, alpha=myalpha, nfolds=10, standardize=TRUE, penalty.factor=force.vars,
+                           type.measure="mse", parallel=T)
+          errors = data.frame(fit$lambda,fit$cvm)
+        }
+
+        ls <- aggregate(ls[, 2], list(ls$fit.lambda), mean)
+        
+        idx = which(ls[2]==min(ls[2]))
+        lbd = ls[idx,1]
+        
+        m.train = fit_lasso(x=x,y=y,lambda=lbd, penalty.factor=force.vars, alpha=myalpha, type.measure="mse")
+        coef(m.train)
+        pred.train = as.data.frame(predict(m.train, type="response", newx=x))
+        err.train <- mean((pred.train$s0 - training$learning)^2)
+        
+        k = 100
+        fs = caret::createDataPartition(testing$learning, times=k, p=0.50)
+        
+        dff = foreach(niter = 1:k, .combine='rbind', .packages=c("glmnet","dplyr","tidyr","doMC")) %dopar% {
+
+          test_sample = testing %>% slice_sample(prop=0.50, replace=F)
+          
+          test_sample = testing[fs[[niter]], ]
+          
+          xxtest <- test_sample %>% ungroup() %>% dplyr::select(all_of(c(pairs,covariates)))
+          xtest = data.matrix(makeX(xxtest, na.impute = TRUE))
+          pred.test <- as.data.frame(predict(m.train, type="response", newx=xtest))
+          err.test <- sqrt(mean((pred.test$s0 - test_sample$learning)^2))
+          
+          xxtest[] <- lapply(xxtest, sample)
+
+          xtest = data.matrix(makeX(xxtest, na.impute = TRUE))
+          pred.test2 <- as.data.frame(predict(m.train, type="response", newx=xtest))
+          err.test2 <- sqrt(mean((pred.test2$s0 - test_sample$learning)^2))
+          
+          temp = data.frame(ID=iAG, Group=uAGs[[iAG]]$name, error=rep(c("train","test","base"), times=c(length(err.train),length(err.test),length(err.test2))),
+                            values=c(err.train,err.test,err.test2), modality=names(l[n]), iter=niter)
+
+          }
+        df.mse = rbind(df.mse, dff)
+        
+      }
+    }
+  }
+}
+
+######### LOGO - python code
+
+import pandas as pd, numpy as np
+import os
+from sklearn import linear_model
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import LeaveOneGroupOut
+from scipy.stats import pearsonr
+
+base_dir = '/media/f02/F02'
+learning_dir = os.path.join(base_dir, 'group','learning')
+
+# specify task
+task = 'acquisition'
+
+if task == "acquisition":
+    cols = ['lCEB_rPFC', 'lHIP_lACC', 'lHIP_lPFC', 'rACC_rPFC', 'rAMY_rACC',
+            'rCEB_lHIP', 'rHIP_rACC']
+elif task == "extinction":
+    cols = ['lAMY_lACC','lAMY_lHIP','lCEB_rACC','lHIP_lPFC','rAMY_rACC','rAMY_rPFC',
+            'rHIP_rACC']
+elif task == "renewal":
+    cols = ['lAMY_lHIP','lPFC_lACC','rPFC_rACC','rPFC_rHIP']
+
+# EC
+df_EC = pd.read_csv(os.path.join(learning_dir,'task-AER_desc-EC_df.tsv'), sep='\t')
+df_EC2 = df_EC.loc[(df_EC.task==task),:]
+
+x = df_EC2[cols].reset_index(drop=True)
+y = df_EC2.loc[:,'learning'].reset_index(drop=True)
+
+groups = list(df_EC2.AG)
+
+lm = linear_model.LinearRegression(fit_intercept=True)
+m = lm.fit(x, y)
+
+feature_names = x.columns
+model_coefficients = m.coef_
+
+coefficients_df = pd.DataFrame(data = model_coefficients, 
+                              index = feature_names, 
+                              columns = ['beta'])
+
+logo=LeaveOneGroupOut()
+scaler = StandardScaler()
+yhat = np.zeros(len(y))
+for train, test in logo.split(x, y, groups):
+    x_std = scaler.fit_transform(x.loc[train,:])
+    y_std = scaler.fit_transform(np.array(y[train]).reshape(-1, 1))
+    m = lm.fit(X=x_std, y=y_std.flatten())
+    yhat[test] = m.predict(x.values[test, :])
+    
+
+df_all = pd.DataFrame({'y':y,'yhat':yhat,'modality':'EC', 'task':task})
+ 
+# FC #
+df_FC = pd.read_csv(os.path.join(learning_dir,'task-AER_desc-FC_df.tsv'), sep='\t')
+df_FC2 = df_FC.loc[(df_FC.task==task),:]
+
+# no directionality so check if roi pair is not reversed
+colsr = ['_'.join(s.split('_')[::-1]) for s in cols]
+cols = list(set.intersection(set(cols+colsr), set(df_FC2.columns)))
+
+x = df_FC2[cols].reset_index(drop=True)
+y = df_FC2.loc[:,'learning'].reset_index(drop=True)
+
+groups = list(df_FC2.AG)
+
+lm = linear_model.LinearRegression(fit_intercept=True)
+m = lm.fit(x, y)
+
+feature_names = x.columns
+model_coefficients = m.coef_
+
+coefficients_df = pd.DataFrame(data = model_coefficients, 
+                              index = feature_names, 
+                              columns = ['beta'])
+
+logo=LeaveOneGroupOut()
+scaler = StandardScaler()
+yhat = np.zeros(len(y))
+for train, test in logo.split(x, y, groups):
+    # standardize x[train]
+    x_std = scaler.fit_transform(x.loc[train,:])
+    y_std = scaler.fit_transform(np.array(y[train]).reshape(-1, 1))
+    m = lm.fit(X=x_std, y=y_std.flatten())
+    yhat[test] = m.predict(x.values[test, :])
+    
+df_all = pd.concat([df_all,
+                    pd.DataFrame({'y':y,'yhat':yhat,'modality':'FC', 'task':task})])
+
+
+# SC #
+df_SC = pd.read_csv(os.path.join(learning_dir,'task-AER_desc-SC_df.tsv'), sep='\t')
+df_SC2 = df_SC.loc[(df_SC.task==task),:]
+
+# no directionality so check if roi pair is not reversed
+colsr = ['_'.join(s.split('_')[::-1]) for s in cols]
+cols = list(set.intersection(set(cols+colsr), set(df_SC2.columns)))
+
+x = df_SC2[cols].reset_index(drop=True)
+# y = df_EC_AC[['learning']].reset_index(drop=True)
+y = df_SC2.loc[:,'learning'].reset_index(drop=True)
+
+groups = list(df_SC2.AG)
+
+lm = linear_model.LinearRegression(fit_intercept=True)
+m = lm.fit(x, y)
+
+feature_names = x.columns
+model_coefficients = m.coef_
+
+coefficients_df = pd.DataFrame(data = model_coefficients, 
+                              index = feature_names, 
+                              columns = ['beta'])
+
+logo=LeaveOneGroupOut()
+scaler = StandardScaler()
+yhat = np.zeros(len(y))
+for train, test in logo.split(x, y, groups):
+    # standardize x[train]
+    x_std = scaler.fit_transform(x.loc[train,:])
+    y_std = scaler.fit_transform(np.array(y[train]).reshape(-1, 1))
+    m = lm.fit(X=x_std, y=y_std.flatten())
+    yhat[test] = m.predict(x.values[test, :])
+    
+df_all = pd.concat([df_all,
+                    pd.DataFrame({'y':y,'yhat':yhat,'modality':'SC', 'task':task})])
+
+df_all.to_csv(os.path.join(learning_dir,'task-{}_desc-LOGO_df.tsv'.format(task)), index=False, sep='\t')
+
+
+###################################################################################
+############################### task FC ###########################################
+
+dat_FC = read.csv(file.path(group_dir, "FC_task", "task-acquisition_desc-FC_df.tsv"), sep='\t')
+
+metric = c('corrLW','xcorr','EuclideanDist','ManhattanDist','WassersteinDist','dtw','MI','mscohe','wavcohe')
+inv = c('EuclideanDist','ManhattanDist','WassersteinDist','dtw')
+absl = c('corrLW')
+
+dat_conn = dat_FC %>% filter(cond=="CSp")
+pair='pair_und'
+
+dat_conn = subset(dat_conn, hemisphere!="bilateral")
+
+df_join = right_join(df_learndemo, dat_conn, by=c("participant","AG","study"), multiple='all')
+
+df_sel = df_join %>% group_by(participant, AG, study) %>% filter(if_all(!!metric, ~ all(!is.na(.x))))
+
+df_sel = composite_score(df_sel, cols=metric, inv=inv, absl=absl, keep_ori="corrLW")
+
+metric = "composite"
+
+selvars = unique(c("participant","AG","study","task",pair,metric,"learning",covariates))
+
+df = df_sel[selvars] %>% group_by(AG,study,task,across(all_of(pair))) %>% group_modify(~ normData(.x)) %>%
+    pivot_wider(names_from=all_of(pair), values_from=all_of(metric), values_fn=mean) %>% ungroup()
+
+df_acq = subset(df, task == "acquisition")
+mdf = df_acq
+
+pairs = colnames(mdf %>% dplyr::select(starts_with(
+  c('AMY','CEB','HIP','ACC','PFC','lAMY','lCEB','lHIP','lACC','lPFC','rAMY','rCEB','rHIP','rACC','rPFC'))))
+
+preds = c("lCEB_rPFC","lHIP_lACC","lHIP_lPFC","rACC_rPFC","rAMY_rACC","rCEB_lHIP","rHIP_rACC")
+pairs2 = pairs[!(pairs %in% c(preds))]
+preds2 = sample(pairs2, length(preds))
+
+f1 = as.formula(paste("learning ~ ", paste(preds,collapse="+")))
+mod1 = lm(f1, data=mdf)
+summary(mod1)
+coefs1 = mean(unname(abs(mod1$coefficients[2:length(mod1$coefficients)])))
+
+f2 = as.formula(paste("learning ~ ", paste(pairs2,collapse="+")))
+mod2 = lm(f2, data=mdf)
+summary(mod2)
+coefs2 = mean(unname(abs(mod2$coefficients[2:length(mod2$coefficients)])))
+
+########################################################################################
+####################################### Simulations ####################################
+
+df_comb = data.frame(); df_coefs = data.frame(); df.mse = data.frame(); df.mse2 = data.frame(); df.boot = data.frame();
+
+if (t == "AC") {
+  l = list(FC=dat_FC)
+} else if (t == "EX") {
+  l = list(SC=dat_DTI)
+} else {
+  l = list(EC=dat_spDCM)
+  
+for (nAG in 1:length(comb_AG)) {
+  AGs = comb_AG[[nAG]]
+  
+  for (n in 1:length(l)) {
+    
+    if (names(l[n]) == 'FC') {
+      metric = c('corrLW','xcorr','EuclideanDist','ManhattanDist','WassersteinDist','dtw','MI','mscohe','wavcohe')
+      inv = c('EuclideanDist','ManhattanDist','WassersteinDist','dtw')
+      absl = c('corrLW')
+      dat_conn = dat_FC
+      pair='pair_und'
+    } else if (names(l[n]) == 'SC') {
+      metric = 'streamlines'
+      dat_conn = dat_DTI
+      pair='pair_und'
+    } else {
+      metric = 'spDCM'
+      dat_conn = dat_spDCM
+      pair='pair_dir'
+    }
+    
+    dat_conn = subset(dat_conn, hemisphere!="bilateral")
+    
+    df_join = right_join(df_learndemo, dat_conn, by=c("participant","AG","study"), multiple='all')
+    
+    ####### CHOOSE WHICH AGs TO INCLUDE IN THE ANALYSIS HERE #######
+    df_join = df_join %>% subset(AG %in% AGs)
+    if (dim(df_join)[1]==0) {next}
+    ################################################################
+    
+    df_sel = df_join %>% group_by(participant, AG, study) %>% filter(if_all(!!metric, ~ all(!is.na(.x))))
+    
+    # Calculate the composite score
+    if (names(l[n]) == 'FC') {
+      df_sel = composite_score(df_sel, cols=metric, inv=inv, absl=absl, keep_ori="corrLW")
+      metric = "composite"
+    }
+    selvars = unique(c("participant","AG","study","task",pair,metric,"learning",covariates))
+    
+	df = df_sel[selvars] %>% group_by(AG,study,task,across(all_of(pair))) %>% group_modify(~ normData(.x)) %>%
+        pivot_wider(names_from=all_of(pair), values_from=all_of(metric), values_fn=mean) %>% ungroup()
+
+    df$const <- factor(rep(1, each=length(df$participant)))
+    
+    df_acq = subset(df, task == "acquisition")
+    df_ext = subset(df, task == "extinction")
+    df_ren = subset(df, task == "renewal")
+
+    if (tasK=="AC") {
+      mdf = df_acq
+    } else if (tasK=="EX") {
+      mdf = df_ext
+    } else {
+	  mdf = df_ren
+    
+    pairs = colnames(mdf %>% dplyr::select(starts_with(
+      c('AMY','CEB','HIP','ACC','PFC','lAMY','lCEB','lHIP','lACC','lPFC','rAMY','rCEB','rHIP','rACC','rPFC'))))
+    
+    # Load saved LASSO predictions
+	results = read.csv(file.path(group_dir, "lasso", "results.tsv"), sep='\t')
+    preds = rownames(results)
+    exclpreds = preds[grepl(paste(c('(Intercept)',covariates), collapse="|"),preds)]
+    
+    df_res = as.data.frame(as.matrix(results)) %>% 
+      filter_all(any_vars(.!=0)) %>% rownames_to_column(var="connection") %>% 
+      filter(!(connection %in% exclpreds))
+    if (dim(df_res)[1]==0) {df_res[1,]=NA}
+    df_res['modality'] = names(l[n])
+    df_res['groups'] = paste(AGs,collapse='_')
+    df_res['N'] = nrow(mdf)
+    
+    
+    preds = df_res$connection
+    if (is.null(preds)) {next}
+    
+    f = as.formula(paste("learning ~", paste(preds,collapse="+")))
+    mdf = mdf %>% mutate(Grouping=case_when(AG %in% c("A08") ~ "PL", AG %in% c("A02","A03","A05","A09","A12") ~ "FL"))
+    
+    preds = df_res$connection
+    if (is.null(preds)) {next}
+    
+    mdf2 = mdf %>% dplyr::select(-c(participant,AG,study,task,const))
+    f = as.formula(paste("learning ~", paste(preds,collapse="+")))
+    
+    temp2 = data.frame()
+    
+    nn_v = c(30,90,150,300,1000,5000)
+    for (nn in nn_v) {    
+      
+      tp = foreach(niter = 1:100, .combine='rbind', .packages=c("MASS","dplyr")) %dopar% {
+        
+        # Get the covariance matrix by species
+        sigma.PL.males <- mdf2 %>% filter((Grouping == "PL") & (sex=="m")) %>% dplyr::select(-c(Grouping, sex)) %>% cov(use="complete")
+        sigma.PL.females <- mdf2 %>% filter((Grouping == "PL") & (sex=="f")) %>% dplyr::select(-c(Grouping, sex)) %>% cov(use="complete")
+        sigma.FL.males <- mdf2 %>% filter((Grouping == "FL") & (sex=="m")) %>% dplyr::select(-c(Grouping, sex)) %>% cov(use="complete")
+        sigma.FL.females <- mdf2 %>% filter((Grouping == "FL") & (sex=="f")) %>% dplyr::select(-c(Grouping, sex)) %>% cov(use="complete")
+        
+        # generate samples based on those covariance matricies
+        means.mdf2 = mdf2 %>% summarise_if(is.numeric, mean, na.rm=T) %>% array %>% unlist
+        emp=F
+        PL.males.rows <- MASS::mvrnorm(n = nn, means.mdf2, sigma.PL.males, empirical = emp)
+        PL.females.rows <- MASS::mvrnorm(n = nn, means.mdf2, sigma.PL.females, empirical = emp)
+        FL.males.rows <- MASS::mvrnorm(n = nn, means.mdf2, sigma.FL.males, empirical = emp)
+        FL.females.rows <- MASS::mvrnorm(n = nn, means.mdf2, sigma.FL.females, empirical = emp)
+        
+        # convert to dataframes
+        PL.males.df <- data.frame(PL.males.rows, Grouping="PL", sex="male")
+        PL.females.df <- data.frame(PL.females.rows, Grouping="PL", sex="female")
+        FL.males.df <- data.frame(FL.males.rows, Grouping="FL", sex="male")
+        FL.females.df <- data.frame(FL.females.rows, Grouping="FL", sex="female")
+        
+        # bind them return species to a factor
+        df1 <- rbind(PL.males.df, PL.females.df, FL.males.df, FL.females.df) 
+        
+        for (iag in unique(df1$Grouping)) {
+          df2 = subset(df1, Grouping==iag)
+          mod1 = lm(f, data=df2)
+          pred.mod1 = as.data.frame(predict(mod1, interval="confidence"))
+          err.mod1 <- mean( (pred.mod1$fit - df2$learning)^2)
+          
+          pairs2 = pairs[!(pairs %in% preds)]
+          preds2 = sample(pairs2, length(preds))
+          
+          f2 = as.formula(paste("learning ~", paste(preds2,collapse="+")))
+          mod2 = lm(f2, data=df2)
+          pred.mod2 = as.data.frame(predict(mod2, interval="confidence"))
+          err.mod2 <- mean( (pred.mod2$fit - df2$learning)^2)
+          
+          err.mod1 = summary(mod1)$r.squared
+          err.mod2 = summary(mod2)$r.squared
+          
+          temp = data.frame(iteration=niter, n=nn, error=c("model","random"), values=c(err.mod1,err.mod2),
+                            modality=names(l[n]), Group=iag)         
+          
+          temp2 = rbind(temp2, temp)
+        }
+        temp2
+      
+      } #end iterations
+      df.mse2 = rbind(df.mse2, tp)
+    }    
+  } # end of simulation
+} # end of for loop for comb_AG
